@@ -1,4 +1,3 @@
-
 import Job, { ExecuteResolve, ExecuteReject, ExecuteCallbacks } from './Job';
 import Display from './Display';
 import * as util from './util';
@@ -444,20 +443,59 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
     }
 
     public async close(): Promise<void> {
+        // Prevent new tasks from being added
         this.isClosed = true;
 
+        // Clear all intervals and timeouts
         clearInterval(this.checkForWorkInterval as NodeJS.Timeout);
         clearTimeout(this.workCallTimeout as NodeJS.Timeout);
 
-        // close workers
-        await Promise.all(this.workers.map(worker => worker.close()));
-
-        try {
-            await (this.browser as ConcurrencyImplementation).close();
-        } catch (err: any) {
-            debug(`Error: Unable to close browser, message: ${err.message}`);
+        // Wait for all in-progress tasks to complete
+        if (this.workersBusy.length > 0) {
+            debug(`Waiting for ${this.workersBusy.length} active tasks to complete...`);
+            await Promise.all(this.workersBusy.map(worker => {
+                return new Promise<void>(resolve => {
+                    const checkWorker = () => {
+                        if (!this.workersBusy.includes(worker)) {
+                            resolve();
+                        } else {
+                            setTimeout(checkWorker, 100);
+                        }
+                    };
+                    checkWorker();
+                });
+            }));
         }
 
+        // Clear any remaining tasks in the queue
+        while (this.jobQueue.size() > 0) {
+            const job = this.jobQueue.shift();
+            if (job?.executeCallbacks) {
+                job.executeCallbacks.reject(new Error('Cluster is shutting down'));
+            }
+        }
+
+        // Close all workers
+        debug('Closing all workers...');
+        await Promise.all(this.workers.map(async worker => {
+            try {
+                await worker.close();
+            } catch (err: any) {
+                debug(`Error closing worker: ${err.message}`);
+            }
+        }));
+
+        // Close the browser
+        debug('Closing browser...');
+        if (this.browser) {
+            try {
+                await this.browser.close();
+            } catch (err: any) {
+                debug(`Error: Unable to close browser, message: ${err.message}`);
+            }
+        }
+
+        // Cleanup monitoring and display
         if (this.monitoringInterval) {
             this.monitor();
             clearInterval(this.monitoringInterval);
@@ -467,9 +505,19 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
             this.display.close();
         }
 
+        // Cleanup system monitor
         this.systemMonitor.close();
 
-        debug('Closed');
+        // Clear arrays and reset state
+        this.workers = [];
+        this.workersAvail = [];
+        this.workersBusy = [];
+        this.idleResolvers = [];
+        this.waitForOneResolvers = [];
+        this.duplicateCheckUrls.clear();
+        this.lastDomainAccesses.clear();
+
+        debug('Cluster closed successfully');
     }
 
     private monitor(): void {
